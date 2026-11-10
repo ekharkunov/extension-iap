@@ -98,6 +98,7 @@ public final class Store: NSObject {
     private var unfinished: [String: Transaction] = [:]
     private var finished = Set<String>()
     private var updatesTask: Task<Void, Never>?
+    private var intentsTask: Task<Void, Never>?
 
     // A purchase can complete after the extension was restarted, its result goes to the store that is active then
     private static let sessionLock = NSLock()
@@ -109,6 +110,22 @@ public final class Store: NSObject {
         updatesTask = Task { [weak self] in
             for await result in Transaction.updates {
                 self?.process(result, source: .update)
+            }
+        }
+        // Purchases started on the App Store product page
+        if #available(iOS 16.4, *) {
+            intentsTask = Task { [weak self] in
+                for await intent in PurchaseIntent.intents {
+                    guard let self, !self.stopped else {
+                        return
+                    }
+                    self.report(StoreTransaction(ident: intent.product.id, state: .purchasing))
+                    var options: Set<Product.PurchaseOption> = []
+                    if #available(iOS 18.0, *), let offer = intent.offer, offer.type == .winBack {
+                        options.insert(.winBackOffer(offer))
+                    }
+                    await self.purchase(intent.product, options: options)
+                }
             }
         }
 
@@ -131,12 +148,19 @@ public final class Store: NSObject {
         isStopped = true
         lock.unlock()
         updatesTask?.cancel()
+        intentsTask?.cancel()
 
         Store.sessionLock.lock()
         if Store.active === self {
             Store.active = nil
         }
         Store.sessionLock.unlock()
+    }
+
+    private var stopped: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isStopped
     }
 
     @objc public func listProducts(_ idents: [String], completion: @escaping ([StoreProduct], String?) -> Void) {
@@ -158,25 +182,38 @@ public final class Store: NSObject {
                     Store.complete { $0.report(StoreTransaction(ident: ident, state: .failed, error: "Unknown product")) }
                     return
                 }
-                switch try await product.purchase() {
-                case .success(let result):
-                    Store.complete { $0.process(result, source: .purchase) }
-                case .userCancelled:
-                    Store.complete { $0.report(StoreTransaction(ident: ident, state: .failed, error: "Purchase canceled by the user", errorReason: .userCanceled)) }
-                case .pending:
-                    Store.complete { $0.report(StoreTransaction(ident: ident, state: .unverified)) }
-                @unknown default:
-                    Store.complete { $0.report(StoreTransaction(ident: ident, state: .failed, error: "Unknown purchase result")) }
-                }
+                await purchase(product)
             } catch {
-                var reason = StoreErrorReason.unspecified
-                if case StoreKitError.userCancelled = error {
-                    reason = .userCanceled
-                }
-                let transaction = StoreTransaction(ident: ident, state: .failed, error: error.localizedDescription, errorReason: reason)
-                Store.complete { $0.report(transaction) }
+                reportFailure(ident, error)
             }
         }
+    }
+
+    private func purchase(_ product: Product, options: Set<Product.PurchaseOption> = []) async {
+        let ident = product.id
+        do {
+            switch try await product.purchase(options: options) {
+            case .success(let result):
+                Store.complete { $0.process(result, source: .purchase) }
+            case .userCancelled:
+                Store.complete { $0.report(StoreTransaction(ident: ident, state: .failed, error: "Purchase canceled by the user", errorReason: .userCanceled)) }
+            case .pending:
+                Store.complete { $0.report(StoreTransaction(ident: ident, state: .unverified)) }
+            @unknown default:
+                Store.complete { $0.report(StoreTransaction(ident: ident, state: .failed, error: "Unknown purchase result")) }
+            }
+        } catch {
+            reportFailure(ident, error)
+        }
+    }
+
+    private func reportFailure(_ ident: String, _ error: Error) {
+        var reason = StoreErrorReason.unspecified
+        if case StoreKitError.userCancelled = error {
+            reason = .userCanceled
+        }
+        let transaction = StoreTransaction(ident: ident, state: .failed, error: error.localizedDescription, errorReason: reason)
+        Store.complete { $0.report(transaction) }
     }
 
     @objc public func processPendingTransactions() {
