@@ -252,6 +252,7 @@
   - name: set_listener
     type: function
     desc: Set the callback function to receive purchase transaction events.
+          On iOS [icon:ios] 16.4 and later the listener also receives purchases that the user starts on the App Store product page, in the same way as the result of `iap.buy()`.
     parameters:
     - name: listener
       type: function
